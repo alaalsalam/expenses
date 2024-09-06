@@ -33,6 +33,7 @@
   "total_taxable_amount",
   "taxes_and_charges_section",
   "expense_entry_taxes_and_charges",
+  "taxes",
   "section_break_25",
   "reference_no",
   "reference_date",
@@ -77,9 +78,9 @@
    "read_only": 1
   },
   {
-   "allow_on_submit": 1,
    "fieldname": "status",
    "fieldtype": "Select",
+   "hidden": 1,
    "label": "Status",
    "options": "Initiated\nPending\nApproved\nRejected"
   },
@@ -244,14 +245,21 @@
   {
    "fieldname": "expense_approver",
    "fieldtype": "Link",
+   "hidden": 1,
    "label": "Expense Approver",
    "options": "User"
+  },
+  {
+   "fieldname": "taxes",
+   "fieldtype": "Table",
+   "label": "Taxes and Charges",
+   "options": "Advance Taxes and Charges"
   }
  ],
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2022-11-29 11:59:46.322717",
+ "modified": "2024-08-29 22:35:41.784971",
  "modified_by": "Administrator",
  "module": "Expenses",
  "name": "Expense Entry",

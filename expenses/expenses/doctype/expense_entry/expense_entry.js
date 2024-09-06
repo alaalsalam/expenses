@@ -25,6 +25,16 @@ frappe.ui.form.on('Expense Entry', {
 			return {
 				filters: [
 					['company', '=', frm.doc.company],
+					['is_group', '=', 0],
+					['account_type', 'in', ["Tax", "Chargeable", "Income Account","Expense Account", "Expenses Included In Valuation"]]
+				]
+			};
+		});
+		frm.set_query("expense_account", "expenses", function() {
+			return {
+				filters: [
+					['company', '=', frm.doc.company],
+					['is_group', '=', 0],
 					['account_type', 'in', ["Tax", "Chargeable", "Income Account", "Expenses Included In Valuation"]]
 				]
 			};
@@ -95,6 +105,162 @@ frappe.ui.form.on('Expense Entry', {
 			}
 		});
 	},
+	fetch_taxes_from_template: function (frm) {
+		let master_doctype = "";
+		let taxes_and_charges = "";
+
+		if (frm.doc.party_type == "Supplier") {
+			master_doctype = "Purchase Taxes and Charges Template";
+			taxes_and_charges = frm.doc.purchase_taxes_and_charges_template;
+		} else if (frm.doc.party_type == "Customer") {
+			master_doctype = "Sales Taxes and Charges Template";
+			taxes_and_charges = frm.doc.sales_taxes_and_charges_template;
+		}
+
+		if (!taxes_and_charges) {
+			return;
+		}
+
+		frappe.call({
+			method: "erpnext.controllers.accounts_controller.get_taxes_and_charges",
+			args: {
+				master_doctype: master_doctype,
+				master_name: taxes_and_charges,
+			},
+			callback: function (r) {
+				if (!r.exc && r.message) {
+					// set taxes table
+					if (r.message) {
+						for (let tax of r.message) {
+							if (tax.charge_type === "On Net Total") {
+								tax.charge_type = "On Paid Amount";
+							}
+							frm.add_child("taxes", tax);
+						}
+						frm.events.apply_taxes(frm);
+						frm.events.set_unallocated_amount(frm);
+					}
+				}
+			},
+		});
+	},
+	apply_taxes: function (frm) {
+		frm.events.initialize_taxes(frm);
+		frm.events.determine_exclusive_rate(frm);
+		frm.events.calculate_taxes(frm);
+	},
+	determine_exclusive_rate: function (frm) {
+		let has_inclusive_tax = false;
+		$.each(frm.doc["taxes"] || [], function (i, row) {
+			if (cint(row.included_in_paid_amount)) has_inclusive_tax = true;
+		});
+		if (has_inclusive_tax == false) return;
+
+		let cumulated_tax_fraction = 0.0;
+		$.each(frm.doc["taxes"] || [], function (i, tax) {
+			tax.tax_fraction_for_current_item = frm.events.get_current_tax_fraction(frm, tax);
+
+			if (i == 0) {
+				tax.grand_total_fraction_for_current_item = 1 + tax.tax_fraction_for_current_item;
+			} else {
+				tax.grand_total_fraction_for_current_item =
+					frm.doc["taxes"][i - 1].grand_total_fraction_for_current_item +
+					tax.tax_fraction_for_current_item;
+			}
+
+			cumulated_tax_fraction += tax.tax_fraction_for_current_item;
+			frm.doc.total_amount = flt(frm.doc.base_paid_amount / (1 + cumulated_tax_fraction));
+		});
+	},
+	initialize_taxes: function (frm) {
+		$.each(frm.doc["taxes"] || [], function (i, tax) {
+			frm.events.validate_taxes_and_charges(tax);
+			frm.events.validate_inclusive_tax(tax);
+			tax.item_wise_tax_detail = {};
+			let tax_fields = [
+				"total",
+				"tax_fraction_for_current_item",
+				"grand_total_fraction_for_current_item",
+			];
+
+			if (cstr(tax.charge_type) != "Actual") {
+				tax_fields.push("tax_amount");
+			}
+
+			$.each(tax_fields, function (i, fieldname) {
+				tax[fieldname] = 0.0;
+			});
+
+			frm.doc.total_amount = frm.doc.base_paid_amount;
+		});
+	},
+	calculate_taxes: function (frm) {
+		frm.doc.total_taxes_and_charges = 0.0;
+		frm.doc.base_total_taxes_and_charges = 0.0;
+
+		let company_currency = frappe.get_doc(":Company", frm.doc.company).default_currency;
+		let actual_tax_dict = {};
+
+		// maintain actual tax rate based on idx
+		$.each(frm.doc["taxes"] || [], function (i, tax) {
+			if (tax.charge_type == "Actual") {
+				actual_tax_dict[tax.idx] = flt(tax.tax_amount, precision("tax_amount", tax));
+			}
+		});
+
+		$.each(frm.doc["taxes"] || [], function (i, tax) {
+			let current_tax_amount = frm.events.get_current_tax_amount(frm, tax);
+
+			// Adjust divisional loss to the last item
+			if (tax.charge_type == "Actual") {
+				actual_tax_dict[tax.idx] -= current_tax_amount;
+				if (i == frm.doc["taxes"].length - 1) {
+					current_tax_amount += actual_tax_dict[tax.idx];
+				}
+			}
+
+			// tax accounts are only in company currency
+			tax.base_tax_amount = current_tax_amount;
+			current_tax_amount *= tax.add_deduct_tax == "Deduct" ? -1.0 : 1.0;
+
+			if (i == 0) {
+				tax.total = flt(frm.doc.total_amount + current_tax_amount, precision("total", tax));
+			} else {
+				tax.total = flt(frm.doc["taxes"][i - 1].total + current_tax_amount, precision("total", tax));
+			}
+
+			// tac accounts are only in company currency
+			tax.base_total = tax.total;
+
+			// calculate total taxes and base total taxes
+			if (frm.doc.payment_type == "Pay") {
+				// tax accounts only have company currency
+				if (tax.currency != frm.doc.paid_to_account_currency) {
+					//total_taxes_and_charges has the target currency. so using target conversion rate
+					frm.doc.total_taxes_and_charges += flt(current_tax_amount / frm.doc.target_exchange_rate);
+				} else {
+					frm.doc.total_taxes_and_charges += current_tax_amount;
+				}
+			} else if (frm.doc.payment_type == "Receive") {
+				if (tax.currency != frm.doc.paid_from_account_currency) {
+					//total_taxes_and_charges has the target currency. so using source conversion rate
+					frm.doc.total_taxes_and_charges += flt(current_tax_amount / frm.doc.source_exchange_rate);
+				} else {
+					frm.doc.total_taxes_and_charges += current_tax_amount;
+				}
+			}
+
+			frm.doc.total_tax_amount += tax.base_tax_amount;
+
+			frm.refresh_field("taxes");
+			frm.refresh_field("total_taxes_and_charges");
+			frm.refresh_field("total_tax_amount");
+		});
+	},
+	taxes: function(frm) {
+        frm.events.calculate_taxes(frm); // إعادة حساب الضرائب
+        frm.refresh_field('total'); // تحديث الحقل total تلقائيًا
+    },
 	
 });
 
@@ -254,3 +420,35 @@ let get_tax_rate = function(account) {
 		});
 	}
 }
+
+frappe.ui.form.on("Advance Taxes and Charges", {
+	rate: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+
+	tax_amount: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+
+	row_id: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+
+	taxes_remove: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+
+	included_in_paid_amount: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+
+	charge_type: function (frm) {
+		frm.events.apply_taxes(frm);
+		frm.events.set_unallocated_amount(frm);
+	},
+});
